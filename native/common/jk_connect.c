@@ -34,7 +34,7 @@
 #include "apr_errno.h"
 #include "apr_general.h"
 #include "apr_pools.h"
-static apr_pool_t *jk_apr_pool = NULL;
+static apr_pool_t *jk_resolv_pool = NULL;
 #endif
 
 #ifdef HAVE_SYS_FILIO_H
@@ -76,6 +76,13 @@ static apr_pool_t *jk_apr_pool = NULL;
 #if !defined(EAFNOSUPPORT) && defined(WSAEAFNOSUPPORT)
 #define EAFNOSUPPORT WSAEAFNOSUPPORT
 #endif
+
+static apr_status_t jk_resolv_cleanup(void *d)
+{
+    /* Clean up pointer content */
+    *(apr_pool_t **)d = NULL;
+    return APR_SUCCESS;
+}
 
 /** Set socket to blocking
  * @param sd  socket to manipulate
@@ -374,6 +381,24 @@ static int nb_connect(jk_sock_t sd, jk_sockaddr_t *addr, jk_sockaddr_t *source,
 }
 #endif
 
+#ifdef AS400_UTF8
+/*
+ *  IBM i need EBCDIC for its runtime calls but APR/APACHE works in UTF
+ */
+in_addr_t jk_inet_addr(const char * addrstr)
+{
+    in_addr_t addr;
+    char *ptr;
+
+    ptr = (char *)malloc(strlen(addrstr) + 1);
+    jk_ascii2ebcdic((char *)addrstr, ptr);
+    addr = inet_addr(ptr);
+    free(ptr);
+
+    return(addr);
+}
+#endif
+
 /** Clone a jk_sockaddr_t
  * @param out     The source structure
  * @param in      The target structure
@@ -415,15 +440,19 @@ int jk_resolve(const char *host, int port, jk_sockaddr_t *saddr,
 #ifdef HAVE_APR
         apr_sockaddr_t *remote_sa, *temp_sa;
 
-        if (!jk_apr_pool) {
-            if (apr_pool_create(&jk_apr_pool, (apr_pool_t *)pool) != APR_SUCCESS) {
+        if (!jk_resolv_pool) {
+            if (apr_pool_create(&jk_resolv_pool, (apr_pool_t *)pool) != APR_SUCCESS) {
                 JK_TRACE_EXIT(l);
                 return JK_FALSE;
             }
+            apr_pool_cleanup_register((apr_pool_t *)pool, &jk_resolv_pool,
+                                      jk_resolv_cleanup, jk_resolv_cleanup);
         }
-        apr_pool_clear(jk_apr_pool);
-        if (apr_sockaddr_info_get(&remote_sa, host, APR_UNSPEC, (apr_port_t)port,
-                                  0, jk_apr_pool) != APR_SUCCESS) {
+        /* We need to clear the pool reference, if the pool gets destroyed
+         * via its parent pool. */
+        apr_pool_clear(jk_resolv_pool);
+        if (apr_sockaddr_info_get(&remote_sa, host, APR_UNSPEC, (apr_port_t) port, 0, jk_resolv_pool)
+               != APR_SUCCESS) {
             JK_TRACE_EXIT(l);
             return JK_FALSE;
         }
@@ -801,7 +830,7 @@ jk_sock_t jk_open_socket(jk_sockaddr_t *addr, jk_sockaddr_t *source,
 /* Need more infos for BSD 4.4 and Unix 98 defines, for now only
 iSeries when Unix98 is required at compile time */
 #if (_XOPEN_SOURCE >= 520) && defined(AS400)
-    ((struct sockaddr *)addr)->sa.sin.sa_len = sizeof(struct sockaddr_in);
+    ((struct sockaddr *)&addr->sa.sin)->sa_len = sizeof(struct sockaddr_in);
 #endif
     ret = nb_connect(sd, addr, source, connect_timeout, l);
 #if defined(WIN32)
